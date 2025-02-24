@@ -1,0 +1,189 @@
+#!/usr/bin/env ruby
+require "json"
+require "securerandom"
+require "optparse"
+
+# Created by Ralf Hulsmann
+#
+# A wrapper around
+# [bookmark-cli](https://github.com/ttscoff/bookmark-cli) to
+# save and retrieve bookmarks with a short ID.
+#
+# Modifications by Brett Terpstra
+#
+# - Translated to English
+# - Added aliases for commands, simple one-letter
+#   subcommands will work, e.g. `bookmarker l` to list
+# - When outputting a list, show resolved path instead of
+#   bookmark blob. Since this wrapper is meant to abstract
+#   bookmark-cli, there"s probably no point in ever
+#   returning the blob.
+# - When listing, separate ids and paths with a tab to make
+#   it easier to parse
+# - Made output commands use warn for messages and print to
+#   STDOUT for just the id or path to make it easier to use
+#   in pipelines
+# - Save bookmarks JSON to ~/.local/share/bookmarks.json
+# - Hardcode path to bookmark binary, change as needed
+# - Allow user to manually specify a key by passing a string
+#   after the path in the `add` command
+# - Add --quiet/-q option to silence verbose output messages
+# - Strip spaces and downcase ID arguments, so "Boom Chicka"
+#   becomes boomchicka for both adding and searching. This
+#   allows, e.g., for a [[Boom Chicka]] wiki link
+
+## Configuration
+# Path to `bookmark` binary (result of `which bookmark`)
+BOOKMARK = "/opt/homebrew/bin/bookmark"
+# Path to JSON file, don't change unless you know what you're doing
+BOOKMARK_FILE = File.expand_path("~/.local/share/bookmarks.json")
+
+# Load JSON file or create new structure
+def load_bookmarks
+  File.exist?(BOOKMARK_FILE) ? JSON.parse(File.read(BOOKMARK_FILE)) : {}
+rescue JSON::ParserError
+  {}
+end
+
+# Save JSON file
+def save_bookmarks(bookmarks)
+  File.directory?(File.dirname(BOOKMARK_FILE)) || FileUtils.mkdir_p(File.dirname(BOOKMARK_FILE))
+  File.write(BOOKMARK_FILE, JSON.pretty_generate(bookmarks))
+end
+
+# Generates a 9-digit random ID
+def generate_id
+  rand(100_000_000..999_999_999).to_s
+end
+
+# Set Finder metadata (for Spotlight search)
+def set_spotlight_metadata(path, id)
+  existing = `mdls --name kMDItemDescription #{path}`.strip
+  id = "#{existing} #{id}" if existing !~ /\(null\)/
+  system("xattr -w com.apple.metadata:kMDItemDescription \"#{id}\" \"#{path}\"")
+end
+
+# Save bookmark with `bookmark save`
+def add_bookmark(path, id = nil)
+  bookmarks = load_bookmarks
+  id ||= generate_id
+
+  while bookmarks.key?(id) # Ensure ID is unique
+    if id =~ /^\d+$/
+      id = generate_id
+    else
+      id = id =~ /-\d+$/ ? id.next : "#{id}-2"
+    end
+  end
+
+  # Call `bookmark save`
+  bookmark_id = `#{BOOKMARK} save "#{path}"`.strip
+  if bookmark_id.empty?
+    puts "Error saving the bookmark."
+    exit(1)
+  end
+
+  # Set Finder metadata
+  set_spotlight_metadata(path, id)
+
+  bookmarks[id] = bookmark_id
+  save_bookmarks(bookmarks)
+
+  warn "Bookmark saved with ID: #{id}"
+  print id
+end
+
+# Retrieve bookmark with `bookmark find`
+def get_bookmark(id)
+  bookmarks = load_bookmarks
+  if bookmarks.key?(id)
+    bookmark_id = bookmarks[id]
+    path = `#{BOOKMARK} find #{bookmark_id}`.strip
+    if path.empty?
+      warn "No valid path found."
+    else
+      warn "#{id}: #{path}"
+      print path
+    end
+  else
+    warn "No bookmark found with this ID."
+  end
+end
+
+# Delete bookmark
+def delete_bookmark(id)
+  bookmarks = load_bookmarks
+  if bookmarks.key?(id)
+    path = `#{BOOKMARK} find #{bookmarks[id]}`.strip
+    if !path.empty?
+      system("xattr -d com.apple.metadata:kMDItemDescription \"#{path}\"") # Delete metadata
+    end
+    bookmarks.delete(id)
+    save_bookmarks(bookmarks)
+    warn "Bookmark with ID #{id} deleted."
+  else
+    warn "No bookmark found with this ID."
+  end
+end
+
+# Display all bookmarks
+def list_bookmarks
+  bookmarks = load_bookmarks
+  if bookmarks.empty?
+    warn "No saved bookmarks."
+  else
+    puts "Saved bookmarks:"
+    bookmarks.each do |id, bookmark_id|
+      path = `#{BOOKMARK} find #{bookmark_id}`.strip
+      puts "#{id}\t#{path.empty? ? "Invalid bookmark" : path}"
+    end
+  end
+end
+
+# CLI control
+command = ARGV[0]
+ARGV.shift
+argument = ARGV[0]&.downcase&.gsub(/ +/, "") if ARGV[0]
+ARGV.shift
+
+id = ARGV.length.positive? ? ARGV[0].downcase.gsub(/ +/, "") : generate_id
+
+$options = { quiet: false }
+parser = OptionParser.new do |opts|
+  opts.on("-q", "--quiet", "Suppress output messages") { $options[:quiet] = true }
+end
+
+parser.parse!
+
+def warn(msg)
+  $stderr.puts msg unless $options[:quiet]
+end
+
+case command
+when /^[as]/i # Add or Save
+  if argument
+    add_bookmark(argument, id)
+  else
+    puts "Specify path: `#{File.basename(__FILE__)} add /path/to/file [alias]`"
+  end
+when /^[gf]/i # Get or Find
+  if argument
+    get_bookmark(argument)
+  else
+    puts "Specify ID: `#{File.basename(__FILE__)} get 123456789`"
+  end
+when /^[dx]/i # Delete or X
+  if argument
+    delete_bookmark(argument)
+  else
+    puts "Specify ID: `#{File.basename(__FILE__)} delete 123456789`"
+  end
+when /^l/
+  list_bookmarks
+else
+  puts "Usage:"
+  puts "  #{File.basename(__FILE__)} add|save /path/to/file [alias] → Save bookmark"
+  puts "  #{File.basename(__FILE__)} get|find 123456789             → Retrieve bookmark"
+  puts "  #{File.basename(__FILE__)} delete|x 123456789             → Delete bookmark"
+  puts "  #{File.basename(__FILE__)} list|ls                        → Show all bookmarks"
+end
